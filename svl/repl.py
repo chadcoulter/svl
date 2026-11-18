@@ -3,7 +3,7 @@
 # Line-by-line verification, block verification on blank line
 # Live feedback: syntax errors, type errors, theorem status
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Sequence
 from dataclasses import dataclass, field
 import sys
 import readline  # For history/completion
@@ -22,6 +22,9 @@ class ReplState:
     module_name: str = "repl"
     in_block: bool = False
     block_depth: int = 0
+    # Top-level declarations that survive between blocks, so a later block can call a
+    # function defined in an earlier one.
+    definitions: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -33,6 +36,63 @@ class ReplConfig:
     verify_on_block: bool = True
     show_timing: bool = True
     max_history: int = 1000
+
+
+def run_wat(wat: str, foreign: Optional[Sequence[bytes]] = None):
+    """Assemble, validate, instantiate and run a WAT module's `<module>_main`.
+
+    Returns (return_value, printed_bytes); return_value is None when the module has no
+    exported entry point.  Shared by the REPL and the Jupyter kernel so both execute
+    through the same host ABI.
+
+    ``foreign`` is a sequence of compiled foreign WASM modules (``.wasm`` bytes).  Any
+    `extern "c"` import that is not one of the builtin host stubs must be provided by
+    one of them, with a matching signature; otherwise `ForeignModuleError` is raised
+    before the program runs.
+    """
+    import wasmtime
+
+    binary = wasmtime.wat2wasm(wat)
+    engine = wasmtime.Engine()
+    module = wasmtime.Module(engine, binary)
+    store = wasmtime.Store(engine)
+    linker = wasmtime.Linker(engine)
+    i32 = wasmtime.ValType.i32()
+    out = bytearray()
+    memory = {}
+
+    def read_mem(ptr, n):
+        if "m" not in memory or ptr < 0 or n < 0:
+            return b""
+        return bytes(memory["m"].read(store, ptr, ptr + n))
+
+    linker.define_func("env", "print", wasmtime.FuncType([i32, i32], []),
+                       lambda p, n: out.extend(read_mem(p, n)))
+    linker.define_func("env", "print_int", wasmtime.FuncType([i32], []),
+                       lambda v: out.extend(str(v).encode()))
+    linker.define_func("env", "putc", wasmtime.FuncType([i32], []),
+                       lambda c: out.append(c & 0xFF))
+    linker.define_func("env", "clear", wasmtime.FuncType([], []), lambda: None)
+    linker.define_func("env", "malloc", wasmtime.FuncType([i32], [i32]), lambda n: 1 << 20)
+    linker.define_func("env", "iterator_next", wasmtime.FuncType([i32], [i32]), lambda h: 0)
+    linker.define_func("env", "await", wasmtime.FuncType([i32], [i32]), lambda x: x)
+
+    from svl.foreign_link import define_foreign, load_foreign_module
+    # Always planned, even with no foreign modules: a program that declares an
+    # `extern` and is given nothing to satisfy it must say so here, not trap later
+    # with wasmtime's generic "unknown import".
+    define_foreign(store, linker, module,
+                   [load_foreign_module(engine, f) for f in foreign or []])
+
+    inst = linker.instantiate(store, module)
+    exports = inst.exports(store)
+    names = [e.name for e in module.exports]
+    if "memory" in names:
+        memory["m"] = exports["memory"]
+    entry = next((n for n in names if n.endswith("_main")), None)
+    if entry is None:
+        return None, bytes(out)
+    return exports[entry](store), bytes(out)
 
 
 class SVLRepl:
@@ -73,9 +133,11 @@ class SVLRepl:
                 
                 line = input(prompt)
                 
-                # Handle empty line (execute block if in block)
+                # Handle empty line: execute the accumulated buffer.  The old
+                # condition (`if self.state.in_block`) meant a single top-level
+                # statement like `let x = 1` was never executed.
                 if not line.strip():
-                    if self.state.in_block:
+                    if self.state.buffer:
                         self._execute_block()
                     continue
                 
@@ -225,6 +287,49 @@ SVL Syntax (22 Hebrew tokens with ASCII aliases):
         # If braces are balanced, statement is complete regardless of control structures
         return True
 
+    def _split_definitions(self, lines: List[str]):
+        """Split a block into (top-level declarations, remaining statement lines).
+
+        Multi-line declarations are captured by brace balancing, so a `func ... { ... }`
+        typed across several lines is kept whole.
+        """
+        defs, stmts, i = [], [], 0
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if stripped.startswith(('func ', 'struct ', 'const ', 'var ', 'type ')):
+                chunk = [lines[i]]
+                depth = lines[i].count('{') - lines[i].count('}')
+                i += 1
+                while depth > 0 and i < len(lines):
+                    chunk.append(lines[i])
+                    depth += lines[i].count('{') - lines[i].count('}')
+                    i += 1
+                defs.append('\n'.join(chunk))
+            else:
+                stmts.append(lines[i])
+                i += 1
+        return defs, stmts
+
+    def _wrapped_source(self) -> str:
+        """Wrap the buffer in `module repl { <definitions> func main() ... }`.
+
+        The verification layers only accept declarations at top level, so a bare
+        `let x = 1` raised "Unexpected token at top level" before it could be evaluated.
+        Declarations from earlier blocks are replayed so later blocks can use them.
+        """
+        block_defs, stmts = self._split_definitions(self.state.buffer)
+        all_defs = list(self.state.definitions)
+        for definition in block_defs:
+            if definition not in all_defs:
+                all_defs.append(definition)
+        prefix = '\n'.join(all_defs)
+        body = '\n'.join(stmts)
+        # A block with a `return` needs a result type; a statement-only block must be
+        # void, or the backend's fall-through `unreachable` traps on a `let`-only body.
+        ret_type = 'int' if 'return' in body else 'void'
+        return (f"module {self.state.module_name} {{\n{prefix}\n"
+                f"func main() type {ret_type} {{\n{body}\n}}\n}}")
+
     def _verify_current_line(self, line: str):
         """Verify a single line (if it's a complete statement)."""
         self.state.buffer.append(line)
@@ -237,7 +342,7 @@ SVL Syntax (22 Hebrew tokens with ASCII aliases):
         if not self.state.buffer:
             return
         
-        source = '\n'.join(self.state.buffer)
+        source = self._wrapped_source()
         
         # Syntax check
         syntax_result = verify_syntax(source, self.syntax_config)
@@ -270,7 +375,7 @@ SVL Syntax (22 Hebrew tokens with ASCII aliases):
             print("Buffer empty")
             return
         
-        source = '\n'.join(self.state.buffer)
+        source = self._wrapped_source()
         print("Running full verification...")
         
         import time
@@ -305,19 +410,40 @@ SVL Syntax (22 Hebrew tokens with ASCII aliases):
         print(f"Total:   {total_time:.1f}ms")
 
     def _execute_block(self):
-        """Execute the current block (verify + show result)."""
+        """Execute the current block: verify, compile, run, print the result.
+
+        Top-level declarations in the block are kept in `state.definitions`, so a later
+        block can call a function (or use a const) defined in an earlier one.
+        """
         if not self.state.buffer:
             return
         
-        source = '\n'.join(self.state.buffer)
-        
-        # Wrap in module if not already
-        if not source.strip().startswith('module'):
-            source = f"module {self.state.module_name} {{\n{source}\n}}"
-        
-        print(f"Executing block...")
+        source = self._wrapped_source()
+        print("Executing block...")
         self._verify_full_buffer()
-        
+
+        block_defs, _ = self._split_definitions(self.state.buffer)
+        for definition in block_defs:
+            if definition not in self.state.definitions:
+                self.state.definitions.append(definition)
+
+        from svl.compiler_wasm import compile_file_to_wasm
+        try:
+            wat = compile_file_to_wasm(source)
+        except Exception as e:
+            print(f"Compilation failed: {e}")
+            self._reset_buffer()
+            return
+
+        try:
+            rv, out = run_wat(wat)
+            if out:
+                sys.stdout.write(out.decode("utf-8", "replace"))
+            if rv is not None:
+                print(f"[{self.state.module_name}_main() returned {rv}]")
+        except Exception as e:
+            print(f"Execution failed: {e}")
+
         # Clear buffer after execution
         self._reset_buffer()
 

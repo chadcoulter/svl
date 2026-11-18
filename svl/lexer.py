@@ -23,6 +23,7 @@ class TokenType(Enum):
     MODULE = auto()   # ל
     IMPORT = auto()   # מ
     EXPORT = auto()   # נ
+    EXTERN = auto()   # extern "c" func — host import declaration
     CONST = auto()    # ס
     VAR = auto()      # ע
     ASSERT = auto()   # פ
@@ -39,6 +40,11 @@ class TokenType(Enum):
     STRING = auto()
     BOOL = auto()
     NULL = auto()
+
+    # Contract prover tokens (P2.1: contract prover)
+    REQUIRES = auto()    # requires
+    ENSURES = auto()    # ensures  
+    INVARIANT = auto()    # invariant
 
     # Effect tokens (H2: Effect System)
     EXCLAMATION = auto()     # !
@@ -156,6 +162,10 @@ class TokenType(Enum):
     # Range operator
     RANGE = auto()           # ..
 
+    # Match / pattern tokens
+    CASE = auto()            # case
+    UNDERSCORE = auto()      # _ (wildcard pattern)
+
     # Special
     EOF = auto()
     ERROR = auto()
@@ -167,6 +177,7 @@ class TokenType(Enum):
 
 
 # Hebrew token mapping (22 standard letters, no final forms)
+# Code points MUST be the regular (non-final) forms: ן/ץ/ך/ם/ף are NOT tokens.
 HEBREW_TOKENS = {
     '\u05D0': TokenType.LET,      # א
     '\u05D1': TokenType.IF,       # ב
@@ -181,13 +192,13 @@ HEBREW_TOKENS = {
     '\u05DB': TokenType.STRUCT,   # כ
     '\u05DC': TokenType.MODULE,   # ל
     '\u05DE': TokenType.IMPORT,   # מ
-    '\u05DF': TokenType.EXPORT,   # נ
+    '\u05E0': TokenType.EXPORT,   # נ
     '\u05E1': TokenType.CONST,    # ס
     '\u05E2': TokenType.VAR,      # ע
     '\u05E4': TokenType.ASSERT,   # פ
-    '\u05E5': TokenType.TRY,      # צ
-    '\u05E6': TokenType.CATCH,    # ק
-    '\u05E7': TokenType.THROW,    # ר
+    '\u05E6': TokenType.TRY,      # צ
+    '\u05E7': TokenType.CATCH,    # ק
+    '\u05E8': TokenType.THROW,    # ר
     '\u05E9': TokenType.ASYNC,    # ש
     '\u05EA': TokenType.AWAIT,    # ת
 }
@@ -287,6 +298,14 @@ class Lexer:
             self._scan_string(start_pos, start_line, start_col)
             return
 
+        # Wildcard `_` — a lone underscore is the match wildcard pattern, but `_foo`
+        # is still an ordinary identifier.
+        if ch == '_':
+            nxt = self.source[self.pos + 1] if self.pos + 1 < self.length else ''
+            if not (nxt.isalnum() or nxt == '_'):
+                self._emit(TokenType.UNDERSCORE, '_', 1, start_pos, start_line, start_col)
+                return
+
         # Identifiers and keywords (ASCII)
         if ch.isalpha() or ch == '_':
             self._scan_identifier(start_pos, start_line, start_col)
@@ -351,10 +370,13 @@ class Lexer:
             'else': TokenType.ELSE, 'while': TokenType.WHILE, 'for': TokenType.FOR,
             'func': TokenType.FUNC, 'return': TokenType.RETURN, 'match': TokenType.MATCH,
             'type': TokenType.TYPE, 'struct': TokenType.STRUCT, 'module': TokenType.MODULE,
-            'import': TokenType.IMPORT, 'export': TokenType.EXPORT, 'const': TokenType.CONST,
+            'import': TokenType.IMPORT, 'export': TokenType.EXPORT, 'extern': TokenType.EXTERN,
+            'const': TokenType.CONST,
             'var': TokenType.VAR, 'assert': TokenType.ASSERT, 'try': TokenType.TRY,
             'catch': TokenType.CATCH, 'throw': TokenType.THROW, 'async': TokenType.ASYNC,
             'await': TokenType.AWAIT,
+            'requires': TokenType.REQUIRES, 'ensures': TokenType.ENSURES,
+            'invariant': TokenType.INVARIANT,
             'in': TokenType.IN,
             'fn': TokenType.FN,
             'effect': TokenType.EFFECT, 'handle': TokenType.HANDLE,
@@ -368,6 +390,7 @@ class Lexer:
             'class': TokenType.CLASS_KW, 'instance': TokenType.INSTANCE_KW, 'where': TokenType.WHERE_KW,
             'forall': TokenType.FORALL, 'implies': TokenType.IMPLIES,
             'box': TokenType.BOX, 'diamond': TokenType.DIAMOND,
+            'case': TokenType.CASE,
             'true': TokenType.BOOL, 'false': TokenType.BOOL, 'null': TokenType.NULL,
             'int': TokenType.IDENT, 'float': TokenType.IDENT, 'string': TokenType.IDENT,
             'bool': TokenType.IDENT, 'void': TokenType.IDENT, 'never': TokenType.IDENT,
@@ -469,10 +492,6 @@ class Lexer:
             self._emit(TokenType.ASSIGN_OR, '|=', 2, start_pos, start_line, start_col)
         elif two_char == '^=':
             self._emit(TokenType.ASSIGN_XOR, '^=', 2, start_pos, start_line, start_col)
-        elif two_char == '<<':
-            self._emit(TokenType.SHIFT_LEFT, '<<', 2, start_pos, start_line, start_col)
-        elif two_char == '>>':
-            self._emit(TokenType.SHIFT_RIGHT, '>>', 2, start_pos, start_line, start_col)
         elif two_char == '..':
             self._emit(TokenType.RANGE, '..', 2, start_pos, start_line, start_col)
         # Single char

@@ -15,6 +15,7 @@ class NodeType(Enum):
     MODULE = "Module"
     IMPORT = "Import"
     EXPORT = "Export"
+    EXTERN_DECL = "ExternDecl"
     FUNC_DECL = "FuncDecl"
     STRUCT_DECL = "StructDecl"
     TYPE_ALIAS = "TypeAlias"
@@ -28,6 +29,7 @@ class NodeType(Enum):
     RETURN_STMT = "ReturnStmt"
     ASSERT_STMT = "AssertStmt"
     TRY_STMT = "TryStmt"
+    THROW_STMT = "ThrowStmt"
     EXPR_STMT = "ExprStmt"
     BINARY_EXPR = "BinaryExpr"
     UNARY_EXPR = "UnaryExpr"
@@ -133,12 +135,31 @@ class Module(ASTNode):
     name: str
     body: 'Block'
     version: Optional['Version'] = None
+    # Whole-program specification: clauses declared at MODULE scope, applying to the
+    # module's entry point (the function exported as `<module>_main`).  This is the
+    # program-level contract — it says what the program as a whole guarantees, as
+    # opposed to the per-function clauses inside the body.
+    spec_requires: Optional[Any] = None
+    spec_ensures: Optional[Any] = None
 
 
 @dataclass
 class Import(ASTNode):
     path: str
     version_constraint: Optional['VersionConstraint'] = None
+
+
+@dataclass
+class ExternDecl(ASTNode):
+    """`extern "c" func name(params) type ret` — a host import declaration.
+
+    The function has no body; the compiler emits an `(import "env" "name" ...)`
+    and calls resolve to it.  This is the language's FFI surface.
+    """
+    name: str
+    params: List['Param']
+    return_type: Optional['TypeExpr']
+    abi: str = "c"
 
 
 @dataclass
@@ -153,6 +174,8 @@ class FuncDecl(ASTNode):
     return_type: Optional['TypeExpr']
     body: 'Block'
     effects: Optional['EffectRow'] = None
+    requires: Optional['Expr'] = None   # precondition: must hold on entry
+    ensures: Optional['Expr'] = None    # postcondition: may refer to `result` and params
 
 
 @dataclass
@@ -213,6 +236,7 @@ class IfStmt(ASTNode):
 class WhileStmt(ASTNode):
     condition: Expr
     body: Block
+    invariant: Optional['Expr'] = None  # loop invariant: must hold on entry and be preserved
 
 
 @dataclass
@@ -238,6 +262,11 @@ class TryStmt(ASTNode):
     catch_var: str
     catch_type: Optional['TypeExpr']
     catch_block: Block
+
+
+@dataclass
+class ThrowStmt(ASTNode):
+    value: 'Expr'
 
 
 @dataclass
@@ -675,11 +704,16 @@ class Parser:
         version = None
         if self.match(TokenType.AT):
             version = self.parse_version()
+        # Optional whole-program specification, between the name and the body:
+        #   module m requires <expr> ensures <expr> { ... }
+        # The clauses apply to the module's entry point (`main`).
+        spec_requires, spec_ensures = self.parse_contract_clauses()
         body = self.parse_block()
         return Module(
             type=NodeType.MODULE,
             line=name_tok.line, column=name_tok.column, offset=name_tok.offset,
-            name=name, version=version, body=body
+            name=name, version=version, spec_requires=spec_requires,
+            spec_ensures=spec_ensures, body=body
         )
 
     def parse_version(self) -> 'Version':
@@ -969,6 +1003,8 @@ class Parser:
     def parse_top_level(self) -> TopLevelItem:
         if self.match_any(TokenType.FUNC, TokenType.FUNC):
             return self.parse_func_decl()
+        elif self.match(TokenType.EXTERN):
+            return self.parse_extern_decl()
         elif self.match_any(TokenType.STRUCT, TokenType.STRUCT):
             return self.parse_struct_decl()
         elif self.match_any(TokenType.TYPE, TokenType.TYPE):
@@ -1004,11 +1040,48 @@ class Parser:
         effects = None
         if self.match(TokenType.EXCLAMATION):
             effects = self.parse_effect_row()
+        # Contract clauses (P2.1): `requires <expr>` and `ensures <expr>` may
+        # appear (in that order) between the signature and the body block.
+        requires, ensures = self.parse_contract_clauses()
         body = self.parse_block()
         return FuncDecl(
             type=NodeType.FUNC_DECL,
             line=name_tok.line, column=name_tok.column, offset=name_tok.offset,
-            name=name, params=params, return_type=return_type, body=body, effects=effects
+            name=name, params=params, return_type=return_type, body=body, effects=effects,
+            requires=requires, ensures=ensures
+        )
+
+    def parse_contract_clauses(self):
+        """Parse optional `requires <expr>` / `ensures <expr>` clauses.
+
+        Returns ``(requires, ensures)`` — either may be ``None``.  A clause's
+        expression ends at the newline/semicolon before the next clause or the
+        function body's opening brace.  We parse a full expression and stop as
+        soon as a non-expression token appears (the `{` of the body, or a keyword).
+        """
+        requires = ensures = None
+        if self.match(TokenType.REQUIRES):
+            requires = self.parse_expr_no_struct_lit()
+        if self.match(TokenType.ENSURES):
+            ensures = self.parse_expr_no_struct_lit()
+        return requires, ensures
+
+    def parse_extern_decl(self) -> ExternDecl:
+        """`extern "c" func name(params) type ret` — a host import with no body."""
+        abi = 'c'
+        if self.match(TokenType.STRING):
+            abi = self.tokens[self.pos - 1].value
+        self.expect(TokenType.FUNC)
+        name_tok = self.expect(TokenType.IDENT)
+        self.expect(TokenType.LPAREN)
+        params = self.parse_params()
+        return_type = None
+        if self.match(TokenType.TYPE):
+            return_type = self.parse_type_expr()
+        return ExternDecl(
+            type=NodeType.EXTERN_DECL,
+            line=name_tok.line, column=name_tok.column, offset=name_tok.offset,
+            name=name_tok.value, params=params, return_type=return_type, abi=abi
         )
 
     def parse_effect_row(self) -> 'EffectRow':
@@ -1070,8 +1143,13 @@ class Parser:
                     line=name_tok.line, column=name_tok.column, offset=name_tok.offset,
                     name=name, type_ann=type_ann
                 ))
-                if not self.match(TokenType.COMMA):
-                    break
+                # Fields may be separated by a comma or just whitespace/newlines
+                # (the rest of the language is newline-separated too).
+                if self.match(TokenType.COMMA):
+                    continue
+                if self.current and self.current.type == TokenType.IDENT:
+                    continue
+                break
             self.expect(TokenType.RBRACE)
         return StructDecl(
             type=NodeType.STRUCT_DECL,
@@ -1144,10 +1222,13 @@ class Parser:
     def parse_stmt(self) -> Stmt:
         if self.current and self.current.type == TokenType.LBRACE:
             return self.parse_block()
-        if self.current and self.current.type in (TokenType.FUNC, TokenType.STRUCT, TokenType.TYPE, TokenType.CONST, TokenType.VAR):
+        if self.current and self.current.type in (TokenType.FUNC, TokenType.STRUCT, TokenType.TYPE, TokenType.CONST, TokenType.VAR, TokenType.EXTERN):
             if self.current.type == TokenType.FUNC:
                 self.advance()
                 return self.parse_func_decl()
+            elif self.current.type == TokenType.EXTERN:
+                self.advance()
+                return self.parse_extern_decl()
             elif self.current.type == TokenType.STRUCT:
                 self.advance()
                 return self.parse_struct_decl()
@@ -1174,6 +1255,13 @@ class Parser:
             return self.parse_assert_stmt()
         elif self.match(TokenType.TRY):
             return self.parse_try_stmt()
+        elif self.match(TokenType.THROW):
+            return self.parse_throw_stmt()
+        elif self.match(TokenType.IMPORT):
+            raise SyntaxError(
+                "import must appear at top level, before any module "
+                f"(at line {getattr(self.current, 'line', '?')})"
+            )
         else:
             expr = self.parse_expr()
             if isinstance(expr, Block):
@@ -1199,7 +1287,7 @@ class Parser:
         )
 
     def parse_if_stmt(self) -> IfStmt:
-        condition = self.parse_expr()
+        condition = self.parse_expr_no_struct_lit()
         self.expect(TokenType.THEN)
         then_branch = self.parse_block()
         else_branch = None
@@ -1214,14 +1302,18 @@ class Parser:
         )
 
     def parse_while_stmt(self) -> WhileStmt:
-        condition = self.parse_expr()
+        condition = self.parse_expr_no_struct_lit()
+        # Optional loop invariant: `invariant <expr>` after the condition and before the body.
+        invariant = None
+        if self.match(TokenType.INVARIANT):
+            invariant = self.parse_expr_no_struct_lit()
         body = self.parse_block()
         return WhileStmt(
             type=NodeType.WHILE_STMT,
             line=self.current.line if self.current else 0,
             column=self.current.column if self.current else 0,
             offset=self.current.offset if self.current else 0,
-            condition=condition, body=body
+            condition=condition, body=body, invariant=invariant
         )
 
     def parse_for_stmt(self) -> ForStmt:
@@ -1275,9 +1367,29 @@ class Parser:
             try_block=try_block, catch_var=var, catch_type=catch_type, catch_block=catch_block
         )
 
+    def parse_throw_stmt(self) -> ThrowStmt:
+        value = self.parse_expr()
+        return ThrowStmt(
+            type=NodeType.THROW_STMT,
+            line=self.current.line if self.current else 0,
+            column=self.current.column if self.current else 0,
+            offset=self.current.offset if self.current else 0,
+            value=value
+        )
+
     # Expression parsing with precedence (highest to lowest)
     def parse_expr(self) -> Expr:
-        return self.parse_assignment()
+        # Bound the recursion: deeply nested parentheses used to escape as a raw
+        # RecursionError. Empirically the interpreter's own limit is hit at ~56 nested
+        # levels (Python frame cost ~15/level with recursionlimit 1000), so guard at 50.
+        depth = getattr(self, '_expr_depth', 0) + 1
+        if depth > 50:
+            raise SyntaxError("expression nesting too deep (>50 levels)")
+        self._expr_depth = depth
+        try:
+            return self.parse_assignment()
+        finally:
+            self._expr_depth = depth - 1
 
     def parse_expr_no_struct_lit(self) -> Expr:
         """Parse expression without struct literal ambiguity (for for-loop iter expressions)."""
@@ -1300,10 +1412,12 @@ class Parser:
             op = self.tokens[self.pos - 1].value
             right = self.parse_assignment()
             
-            # Assignment target must be an identifier
-            if isinstance(left, Ident):
+            # Assignment targets: a local/name, an array element, or a struct field.
+            # Without memory targets the language could read `a[i]` / `p.x` but never
+            # mutate them — which rules out most real programs.
+            if isinstance(left, (Ident, IndexExpr, FieldAccess)):
                 return AssignExpr(
-                    type=NodeType.BINARY_EXPR,
+                    type=NodeType.ASSIGN_EXPR if hasattr(NodeType, 'ASSIGN_EXPR') else NodeType.BINARY_EXPR,
                     line=left.line, column=left.column, offset=left.offset,
                     target=left, operator=op, value=right
                 )
@@ -1476,7 +1590,8 @@ class Parser:
         return left
 
     def parse_unary(self) -> Expr:
-        if self.match(TokenType.MINUS, TokenType.NOT, TokenType.BITWISE_NOT):
+        if self.match(TokenType.MINUS, TokenType.NOT, TokenType.BITWISE_NOT,
+                      TokenType.EXCLAMATION):
             op = self.tokens[self.pos - 1].value
             operand = self.parse_unary()
             return UnaryExpr(
@@ -1575,8 +1690,12 @@ class Parser:
 
         # Identifiers / Hebrew tokens
         # Struct literal check must come BEFORE generic IDENT match
-        # because struct literal starts with IDENT followed by LBRACE
-        if self.current and self.current.type == TokenType.IDENT and self.peek() and self.peek().type == TokenType.LBRACE:
+        # because struct literal starts with IDENT followed by LBRACE.
+        # It must also be suppressed inside contexts that disable it (loop/if conditions,
+        # for-loop iterables) — otherwise `while i < n {` steals `n {` as a struct literal.
+        if (getattr(self, '_allow_struct_lit', True)
+                and self.current and self.current.type == TokenType.IDENT
+                and self.peek() and self.peek().type == TokenType.LBRACE):
             return self.parse_struct_lit()
 
         if self.match(TokenType.IDENT):
@@ -1587,16 +1706,23 @@ class Parser:
                 name=name
             )
 
+        # Match / await are expression forms that start with a keyword token. They must be
+        # handled BEFORE the keyword-as-identifier map below, otherwise `match x { ... }`
+        # is consumed as an identifier named MATCH and the `{` then reads as a struct literal.
+        if self.match(TokenType.MATCH):
+            return self.parse_match_expr()
+        if self.match(TokenType.AWAIT):
+            return self.parse_await_expr()
+
         # Hebrew tokens as standalone keywords
         hebrew_map = {
             TokenType.LET: 'LET', TokenType.IF: 'IF', TokenType.THEN: 'THEN',
             TokenType.ELSE: 'ELSE', TokenType.WHILE: 'WHILE', TokenType.FOR: 'FOR',
-            TokenType.FUNC: 'FUNC', TokenType.RETURN: 'RETURN', TokenType.MATCH: 'MATCH',
+            TokenType.FUNC: 'FUNC', TokenType.RETURN: 'RETURN',
             TokenType.TYPE: 'TYPE', TokenType.STRUCT: 'STRUCT', TokenType.MODULE: 'MODULE',
             TokenType.IMPORT: 'IMPORT', TokenType.EXPORT: 'EXPORT', TokenType.CONST: 'CONST',
             TokenType.VAR: 'VAR', TokenType.ASSERT: 'ASSERT', TokenType.TRY: 'TRY',
             TokenType.CATCH: 'CATCH', TokenType.THROW: 'THROW', TokenType.ASYNC: 'ASYNC',
-            TokenType.AWAIT: 'AWAIT',
         }
         for tt, kw in hebrew_map.items():
             if self.match(tt):
@@ -1696,7 +1822,9 @@ class Parser:
         )
 
     def parse_match_expr(self) -> MatchExpr:
-        subject = self.parse_expr()
+        # The subject is followed by `{`, so it must be parsed with struct literals
+        # disabled — otherwise `match x {` steals `x {` as a struct literal.
+        subject = self.parse_expr_no_struct_lit()
         self.expect(TokenType.LBRACE)
         cases = []
         while not self.match(TokenType.RBRACE):
@@ -1710,7 +1838,9 @@ class Parser:
     def parse_case_clause(self) -> CaseClause:
         self.expect(TokenType.CASE)
         pattern = self.parse_pattern()
-        self.expect(TokenType.FAT_ARROW)
+        # `=>` is the canonical arrow; accept `->` too since it reads naturally.
+        if not self.match(TokenType.FAT_ARROW, TokenType.ARROW):
+            raise SyntaxError(f"expected '=>' after a match pattern, got {self.current}")
         body = self.parse_expr()
         return CaseClause(
             type=NodeType.CASE_CLAUSE,
@@ -1725,12 +1855,17 @@ class Parser:
                 line=self.current.line, column=self.current.column, offset=self.current.offset,
                 kind='wildcard', value=None
             )
-        if self.match(TokenType.LITERAL):
-            return Pattern(
-                type=NodeType.PATTERN,
-                line=self.current.line, column=self.current.column, offset=self.current.offset,
-                kind='literal', value=str(self.tokens[self.pos - 1].value)
-            )
+        # Literal patterns: the lexer emits the real literal token kinds (INT/FLOAT/STRING/
+        # BOOL). The old code matched a `TokenType.LITERAL` that does not exist.
+        for tok_type, kind in ((TokenType.INT, 'int'), (TokenType.FLOAT, 'float'),
+                               (TokenType.STRING, 'string'), (TokenType.BOOL, 'bool'),
+                               (TokenType.NULL, 'null')):
+            if self.match(tok_type):
+                return Pattern(
+                    type=NodeType.PATTERN,
+                    line=self.current.line, column=self.current.column, offset=self.current.offset,
+                    kind=kind, value=self.tokens[self.pos - 1].value
+                )
         if self.match(TokenType.IDENT):
             name = self.tokens[self.pos - 1].value
             if self.match(TokenType.LBRACE):
@@ -1979,7 +2114,9 @@ class Parser:
                 types.append(self.parse_type_expr())
                 if not self.match(TokenType.COMMA):
                     break
-                self.expect(TokenType.RPAREN)
+            # The closing paren was never consumed, so `(int)` left a stray `)` and
+            # `(int, int)` mis-parsed entirely -- every tuple type failed to parse.
+            self.expect(TokenType.RPAREN)
             return TypeExpr(
                 type=NodeType.TYPE_EXPR,
                 line=self.current.line, column=self.current.column, offset=self.current.offset,
@@ -2029,9 +2166,17 @@ class IndexExpr(ASTNode):
 
 
 def parse(tokens: List[Token]) -> Program:
-    """Convenience function to parse tokens."""
+    """Convenience function to parse tokens.
+
+    A RecursionError escaping from here is normalised to SyntaxError: a caller with a
+    deeper stack can hit the interpreter limit before the in-parser depth guard, and an
+    unclean crash is not an acceptable failure mode for bad input.
+    """
     parser = Parser(tokens)
-    return parser.parse()
+    try:
+        return parser.parse()
+    except RecursionError:
+        raise SyntaxError("expression nesting too deep (parser recursion limit reached)") from None
 
 
 if __name__ == '__main__':

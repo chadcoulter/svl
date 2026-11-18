@@ -55,6 +55,14 @@ class TheoremVerifyResultWrapper:
     smt_result: Optional[Any] = None
     smt_logic: Optional[str] = None
     smt_solver_time_ms: float = 0.0
+    # `smt_status` is the honest tri-state (`proven` / `counterexample` / `unverified` /
+    # `vacuous` / `not_run`).  `smt_complete` is True only when the prover discharged
+    # everything it was asked to: `unverified` means it DECLINED, which is not a pass.
+    smt_status: str = "not_run"
+    smt_complete: bool = True
+    # The BPSW monodromy computation is reported for information only: it is
+    # constant-true (0/60 valid programs fail it) and contributes nothing to `passed`.
+    bpsw_status: str = "informational"
 
 
 @dataclass
@@ -157,12 +165,30 @@ class TheoremLayer:
                     smt_verified = smt_result.passed
                     smt_logic = smt_result.logic.value
                     smt_solver_time_ms = smt_result.solver_time_ms
-                    
-                    if not smt_verified and smt_result.error_message:
+
+                    # `passed` means "no counterexample found", NOT "verified".  Say so:
+                    # an unverified result must be visible as a warning rather than silently
+                    # riding along as a green tick.
+                    if smt_result.status == 'unverified':
+                        warnings.append(
+                            "SMT verification is NOT a proof "
+                            f"(status=unverified): {smt_result.error_message or 'not modelled'}")
+                    elif smt_result.status == 'vacuous':
+                        warnings.append(
+                            "SMT verification discharged nothing (the program has no "
+                            "assertions); this is not a proof")
+                    elif not smt_verified and smt_result.error_message:
                         warnings.append(f"SMT verification: {smt_result.error_message}")
                         
                 except Exception as e:
                     warnings.append(f"SMT verification error: {e}")
+
+            # `passed` means "everything that ran passed AND nothing was left unverified".
+            # An SMT status of `unverified` means the layer DECLINED to model part of the
+            # program — it proved nothing, so it must not read as a green tick.  `vacuous`
+            # (no assertions) is complete: there was nothing to discharge.
+            smt_status = smt_result.status if smt_result is not None else "not_run"
+            smt_complete = smt_result is None or smt_result.status in ("proven", "vacuous")
 
             # 4. Golden reference verification
             golden_ref_match = True
@@ -172,7 +198,10 @@ class TheoremLayer:
                 if not golden_ref_match:
                     warnings.append("Golden reference verification failed")
 
-            all_passed = syntax_ok and type_ok and theorem_result.passed and golden_ref_match and smt_verified
+            # The BPSW "theorem" layer is constant-true (measured 0/60 valid programs
+            # fail it) and is deliberately NOT part of `passed`: it gates nothing and
+            # must not be presented as evidence.  It is reported as informational.
+            all_passed = syntax_ok and type_ok and golden_ref_match and smt_complete
 
             return TheoremVerifyResultWrapper(
                 passed=all_passed,
@@ -180,6 +209,7 @@ class TheoremLayer:
                 program_hash_hex=theorem_result.program_hash_hex,
                 monodromy_results=theorem_result.monodromy_results,
                 all_parities_even=theorem_result.all_parities_even,
+                bpsw_status="informational",
                 syntax_layer_verified=syntax_ok,
                 type_layer_verified=type_ok,
                 errors=errors,
@@ -187,7 +217,9 @@ class TheoremLayer:
                 smt_verified=smt_verified,
                 smt_result=smt_result,
                 smt_logic=smt_logic,
-                smt_solver_time_ms=smt_solver_time_ms
+                smt_solver_time_ms=smt_solver_time_ms,
+                smt_status=smt_status,
+                smt_complete=smt_complete
             )
 
         except Exception as e:
@@ -197,7 +229,9 @@ class TheoremLayer:
                 program_hash_hex="",
                 monodromy_results={},
                 all_parities_even=False,
-                errors=[f"Theorem verification error: {e}"]
+                errors=[f"Theorem verification error: {e}"],
+                smt_status="error",
+                smt_complete=False
             )
 
     def verify_file(self, filepath: str) -> TheoremVerifyResultWrapper:

@@ -15,6 +15,46 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.exceptions import InvalidSignature
 
 
+def _attestation_payload(package_name: str, package_version: str, content_hash: str) -> bytes:
+    """The exact bytes every attestation signs.
+
+    One construction, used by the signer and by every verifier.  Three separate
+    f-strings that can drift would let an attestation signed by one path verify under
+    another with different bytes.
+    """
+    return f"{package_name}:{package_version}:{content_hash}".encode()
+
+
+def _pss() -> padding.PSS:
+    """The one padding scheme for every attestation."""
+    return padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH)
+
+
+def verify_attestation_signature(signature: bytes, public_key_der: bytes,
+                                 package_name: str, package_version: str,
+                                 content_hash: str) -> bool:
+    """Check `signature` against a REGISTERED public key.
+
+    Returns False on any failure — an attestation that cannot be checked is not a
+    verified one.  Callers must pass the key obtained from ``self.verifiers``, never
+    the key carried by the attestation itself: that key is supplied by the party being
+    verified, so trusting it makes the check attacker-controlled.
+    """
+    try:
+        public_key = serialization.load_der_public_key(public_key_der)
+        if not isinstance(public_key, rsa.RSAPublicKey):
+            return False
+        public_key.verify(
+            signature,
+            _attestation_payload(package_name, package_version, content_hash),
+            _pss(),
+            hashes.SHA256()
+        )
+        return True
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 class PackageType(Enum):
     """Type of package."""
     LIBRARY = "library"
@@ -60,6 +100,11 @@ class VerificationAttestation:
     timestamp: float = field(default_factory=time.time)
     status: VerificationStatus = VerificationStatus.UNVERIFIED
     attestation_id: str = field(default_factory=lambda: hashlib.sha256(str(time.time()).encode()).hexdigest()[:16])
+    # Reproducible-build identity, copied from the artifact's own `svl.attest` section when
+    # there is one.  `content_hash` binds the exact bytes; these bind the PROGRAM, so two
+    # builds of the same source from different layouts still compare equal.
+    ast_sha256: Optional[str] = None
+    gate231: Optional[List[int]] = None
 
 
 @dataclass
@@ -100,7 +145,20 @@ class PackageRegistry:
                 data = json.load(f)
                 for pkg_data in data.get("packages", []):
                     metadata = PackageMetadata(**pkg_data["metadata"])
-                    attestations = [VerificationAttestation(**a) for a in pkg_data.get("attestations", [])]
+                    attestations = []
+                    for a in pkg_data.get("attestations", []):
+                        a = dict(a)
+                        # signature/public_key are persisted as hex; without decoding them the
+                        # reloaded attestation can never verify (verification silently broke
+                        # for any registry that was saved and loaded again).
+                        for field in ("signature", "public_key"):
+                            value = a.get(field)
+                            if isinstance(value, str):
+                                try:
+                                    a[field] = bytes.fromhex(value)
+                                except ValueError:
+                                    a[field] = value.encode("utf-8", "replace")
+                        attestations.append(VerificationAttestation(**a))
                     record = PackageRecord(
                         metadata=metadata,
                         attestations=attestations,
@@ -131,7 +189,9 @@ class PackageRegistry:
                     "public_key": a.public_key.hex(),
                     "timestamp": a.timestamp,
                     "status": a.status.value,
-                    "attestation_id": a.attestation_id
+                    "attestation_id": a.attestation_id,
+                    "ast_sha256": a.ast_sha256,
+                    "gate231": a.gate231
                 })
             package_list.append({
                 "metadata": {
@@ -185,13 +245,42 @@ class PackageRegistry:
 
     def publish_package(self, package_path: str, metadata: PackageMetadata,
                         content_hash: str, signer_key_pem: bytes) -> bool:
-        """Publish a package with self-attestation."""
+        """Publish a package with self-attestation.
+
+        The attestation is marked VERIFIED only when there is something to check: a compiled
+        SVL artifact (wasm magic) must carry a valid `svl.attest` section whose canonical hash
+        matches the bytes it is handed.  Any other content is still published and still
+        signed, but recorded as UNVERIFIED -- previously EVERY publish was marked VERIFIED
+        unconditionally, which made the status meaningless.
+
+        For a self-attesting artifact the canonical AST fingerprint (`ast_sha256`, `gate231`)
+        is copied off the artifact's own section onto the attestation, so the registry exposes
+        the reproducible-build identity and not only the byte hash.
+        """
         # Compute content hash
         with open(package_path, 'rb') as f:
             content = f.read()
             computed_hash = hashlib.sha256(content).hexdigest()
             if computed_hash != content_hash:
                 return False
+
+        # Decide the honest status, and harvest the artifact's own self-attestation.
+        ast_sha256: Optional[str] = None
+        gate231: Optional[List[int]] = None
+        status = VerificationStatus.UNVERIFIED
+        if content[:4] == b"\x00asm":
+            try:
+                from svl.attest import verify_attestation, extract_attestation
+                attested_ok, _details = verify_attestation(content)
+                payload = extract_attestation(content) or {}
+                if isinstance(payload.get("ast_sha256"), str):
+                    ast_sha256 = payload["ast_sha256"]
+                if isinstance(payload.get("gate231"), list):
+                    gate231 = [int(x) for x in payload["gate231"]]
+                if attested_ok:
+                    status = VerificationStatus.VERIFIED
+            except Exception:                                      # noqa: BLE001
+                status = VerificationStatus.UNVERIFIED
 
         # Sign the attestation
         try:
@@ -202,13 +291,9 @@ class PackageRegistry:
             return False
 
         # Create attestation
-        attestation_data = f"{metadata.name}:{metadata.version}:{content_hash}".encode()
         signature = private_key.sign(
-            attestation_data,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
+            _attestation_payload(metadata.name, metadata.version, content_hash),
+            _pss(),
             hashes.SHA256()
         )
 
@@ -225,19 +310,24 @@ class PackageRegistry:
             verifier_id=metadata.author,  # Self-attestation by author
             signature=signature,
             public_key=public_key_der,
-            status=VerificationStatus.VERIFIED
+            status=status,
+            ast_sha256=ast_sha256,
+            gate231=gate231
         )
 
-        # Create or update package record
+        # Create or update package record.  `verified_content_hash` is a claim that something
+        # checked the bytes, so it is only set for an attestation that actually verified.
         if metadata.name in self.packages:
             record = self.packages[metadata.name]
             record.metadata = metadata
             record.attestations.append(attestation)
+            if status == VerificationStatus.VERIFIED:
+                record.verified_content_hash = content_hash
         else:
             record = PackageRecord(
                 metadata=metadata,
                 attestations=[attestation],
-                verified_content_hash=content_hash
+                verified_content_hash=content_hash if status == VerificationStatus.VERIFIED else None
             )
             self.packages[metadata.name] = record
 
@@ -266,11 +356,8 @@ class PackageRegistry:
         if record.verified_content_hash and record.verified_content_hash != content_hash:
             return False
 
-        # Verify signature
+        # Verify signature against the REGISTERED key.
         public_key_der = self.verifiers[verifier_id]
-        public_key = serialization.load_der_public_key(public_key_der)
-
-        attestation_data = f"{package_name}:{package_version}:{content_hash}".encode()
 
         # Find attestation by this verifier
         attestation = None
@@ -282,34 +369,52 @@ class PackageRegistry:
         if not attestation:
             return False
 
-        try:
-            public_key = serialization.load_der_public_key(attestation.public_key)
-            public_key.verify(
-                attestation.signature,
-                f"{package_name}:{package_version}:{content_hash}".encode(),
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-            return True
-        except (InvalidSignature, Exception):
-            return False
+        # If the package content is a compiled SVL artifact, require its self-attestation to
+        # check out. That is the only check that binds the verification to the actual code
+        # bytes (see svl/attest.py) rather than to a signed claim about a hash.
+        if content[:4] == b"\x00asm":
+            try:
+                from svl.attest import verify_attestation
+                attested_ok, _details = verify_attestation(content)
+            except Exception:                                      # noqa: BLE001
+                attested_ok = False
+            if not attested_ok:
+                return False
+
+        # Verify signature against the REGISTERED key.  The previous code loaded the key
+        # into a local and called `.verify` inline; it is now the same helper every other
+        # path uses, so the signed bytes cannot drift between signer and verifiers.
+        return verify_attestation_signature(
+            attestation.signature, public_key_der, package_name, package_version, content_hash
+        )
 
     def add_verification(self, package_name: str, package_version: str,
                          content_hash: str, verifier_id: str,
                          signature: bytes, public_key: bytes) -> bool:
-        """Add a verification attestation from a registered verifier."""
+        """Add a verification attestation from a registered verifier.
+
+        The signature is CHECKED against the REGISTERED key over
+        ``name:version:content_hash``.  The previous version compared only the
+        caller-supplied ``public_key`` bytes to the registered key and then wrote
+        ``status=VERIFIED`` without verifying anything — so anyone who knew a registered
+        public key could attest arbitrary content, **and** pin its hash as the record's
+        ``verified_content_hash``, which later makes ``verify_package`` compare real
+        bytes against the attacker's hash.
+
+        A failed check now refuses the attestation and leaves the record untouched.
+        """
         if package_name not in self.packages:
             return False
 
         if verifier_id not in self.verifiers:
             return False
 
-        # Verify the signature matches the registered verifier
         verifier_pk_der = self.verifiers[verifier_id]
         if public_key != verifier_pk_der:
+            return False
+
+        if not verify_attestation_signature(signature, verifier_pk_der, package_name,
+                                            package_version, content_hash):
             return False
 
         attestation = VerificationAttestation(
